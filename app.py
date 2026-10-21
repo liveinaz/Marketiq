@@ -1,4 +1,4 @@
-import os, sqlite3, datetime as dt, json, math, time
+import os, sqlite3, datetime as dt, json, math, time, io
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -14,6 +14,41 @@ DB = Path(os.environ.get('MARKETIQ_DB', str(Path(__file__).parent/'marketiq.db')
 DEFAULT=['AAPL','MSFT','NVDA','GOOGL','AMZN','META','TSLA','JPM','V','COST','SPY','QQQ']
 API=os.getenv('FINNHUB_API_KEY','').strip()
 OPENAI=os.getenv('OPENAI_API_KEY','').strip()
+SUPABASE_URL=os.getenv('SUPABASE_URL','').rstrip('/')
+SUPABASE_SERVICE_KEY=os.getenv('SUPABASE_SERVICE_ROLE_KEY','')
+REMOTE_BACKUP=bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
+
+def backup_headers():
+    return {'apikey':SUPABASE_SERVICE_KEY,'Authorization':'Bearer '+SUPABASE_SERVICE_KEY,'Content-Type':'application/json'}
+
+def remote_load():
+    if not REMOTE_BACKUP:return False
+    try:
+        r=requests.get(SUPABASE_URL+'/rest/v1/marketiq_backup',params={'id':'eq.1','select':'payload'},headers=backup_headers(),timeout=12)
+        r.raise_for_status()
+        if not r.json():return False
+        data=r.json()[0]['payload']
+        with sqlite3.connect(DB) as c:
+            for table in ('orders','watchlist','settings'):
+                c.execute('DELETE FROM '+table)
+                if table=='orders':
+                    c.executemany('INSERT INTO orders(id,ts,symbol,side,shares,price,rationale) VALUES(?,?,?,?,?,?,?)',[(x['id'],x['ts'],x['symbol'],x['side'],x['shares'],x['price'],x['rationale']) for x in data.get(table,[])])
+                elif table=='watchlist':c.executemany('INSERT INTO watchlist(symbol) VALUES(?)',[(x['symbol'],) for x in data.get(table,[])])
+                else:c.executemany('INSERT INTO settings(key,value) VALUES(?,?)',[(x['key'],x['value']) for x in data.get(table,[])])
+        return True
+    except Exception:return False
+
+def remote_save(conn):
+    if not REMOTE_BACKUP:return True
+    try:
+        conn.commit()
+        conn.row_factory=sqlite3.Row
+        data={table:[dict(row) for row in conn.execute('SELECT * FROM '+table)] for table in ('orders','watchlist','settings')}
+        r=requests.post(SUPABASE_URL+'/rest/v1/marketiq_backup',headers={**backup_headers(),'Prefer':'resolution=merge-duplicates,return=minimal'},json={'id':1,'payload':data},timeout=15)
+        r.raise_for_status()
+        return True
+    except Exception:return False
+
 
 def db():
     conn=sqlite3.connect(DB,check_same_thread=False)
@@ -21,6 +56,9 @@ def db():
     conn.execute('CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, symbol TEXT, side TEXT, shares REAL, price REAL, rationale TEXT)')
     conn.execute('CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)')
     conn.commit()
+    if REMOTE_BACKUP and not st.session_state.get('remote_initialized'):
+        st.session_state['remote_initialized']=True
+        st.session_state['remote_loaded']=remote_load()
     return conn
 
 def setting(conn,key,default):
@@ -28,7 +66,7 @@ def setting(conn,key,default):
     return r[0] if r else default
 
 def putsetting(conn,key,val):
-    conn.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,str(val)));conn.commit()
+    conn.execute('INSERT OR REPLACE INTO settings VALUES(?,?)',(key,str(val)));conn.commit();remote_save(conn)
 
 @st.cache_data(ttl=180,show_spinner=False)
 def api(path,params):
@@ -125,6 +163,8 @@ with st.sidebar:
     if not API or API=='your_finnhub_key_here':st.warning('No market-data key. Add FINNHUB_API_KEY in Settings or .env to load prices.')
     else:st.success('Market data configured')
     st.caption('No Fidelity credentials required. No live brokerage orders are possible.')
+    if REMOTE_BACKUP:st.success('Remote backup configured')
+    else:st.warning('Paper records are stored on temporary hosting. Export the journal regularly; configure remote backup before relying on history.')
 
 symbols=[x[0] for x in conn.execute('SELECT symbol FROM watchlist ORDER BY symbol').fetchall()] or DEFAULT
 st.title({'Overview':'Market overview','Stock Scanner':'Stock scanner','Stock Research':'Company research','News Desk':'Market news desk','Paper Trading':'Paper trading','Trade Journal':'Trade journal','Settings':'App settings'}[page])
@@ -134,17 +174,20 @@ if page=='Settings':
     st.subheader('Connect market data')
     st.markdown('Get a Finnhub API key at [finnhub.io](https://finnhub.io). Set `FINNHUB_API_KEY` in your host environment or `.env` file, then restart. Free-tier rate limits and news access vary. Never paste brokerage credentials here.')
     st.markdown('Optional: set `OPENAI_API_KEY` for AI-written research summaries. The core scoring engine works without it.')
+    st.subheader('Persistent paper-trade backup')
+    if REMOTE_BACKUP:st.success('Supabase backup configured. Keep your app private: service-role keys must never be in GitHub.')
+    else:st.warning('This deployment uses temporary SQLite storage. To enable persistent backups, create the Supabase table described in README and add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in Streamlit Secrets. Do not share the app publicly with personal trading data.')
     st.subheader('Watchlist')
     new=st.text_input('Add ticker',placeholder='e.g. AMD').strip().upper()
     if st.button('Add to watchlist') and new:
         if new.replace('.','').replace('-','').isalnum() and len(new)<=12:
-            conn.execute('INSERT OR IGNORE INTO watchlist VALUES(?)',(new,));conn.commit();st.rerun()
+            conn.execute('INSERT OR IGNORE INTO watchlist VALUES(?)',(new,));conn.commit();remote_save(conn);st.rerun()
         else:st.error('Invalid symbol')
     st.write(', '.join(symbols))
     remove=st.selectbox('Remove ticker',symbols)
     if st.button('Remove selected'):
         for s in symbols:conn.execute('INSERT OR IGNORE INTO watchlist VALUES(?)',(s,))
-        conn.execute('DELETE FROM watchlist WHERE symbol=?',(remove,));conn.commit();st.rerun()
+        conn.execute('DELETE FROM watchlist WHERE symbol=?',(remove,));conn.commit();remote_save(conn);st.rerun()
     st.subheader('Paper account')
     bal=st.number_input('Initial simulated cash ($)',min_value=100.,value=float(setting(conn,'starting_cash','25000')),step=1000.)
     if st.button('Save starting cash'):
@@ -155,7 +198,7 @@ if page=='Settings':
     if st.session_state.get('confirm_reset'):
         st.warning('This permanently deletes your simulated trades.')
         if st.button('Confirm delete all paper trades'):
-            conn.execute('DELETE FROM orders');conn.commit();st.session_state['confirm_reset']=False;st.rerun()
+            conn.execute('DELETE FROM orders');conn.commit();remote_save(conn);st.session_state['confirm_reset']=False;st.rerun()
 
 elif page in ('Overview','Stock Scanner'):
     st.info('Scanner ranks only the selected watchlist/universe, not the entire U.S. market. Scores are transparent heuristics, not AI probabilities or proven predictions.')
@@ -223,21 +266,30 @@ elif page in ('Paper Trading','Trade Journal'):
     if holdings:st.dataframe(pd.DataFrame(holdings),hide_index=True,use_container_width=True)
     if page=='Paper Trading':
         st.subheader('Record simulated order')
+        sym=st.selectbox('Ticker',symbols,key='paper_ticker')
+        q=quote(sym)
+        if st.session_state.get('price_ticker') != sym:
+            st.session_state['paper_price']=float(q['price']) if q else 100.
+            st.session_state['price_ticker']=sym
+        if st.button('Use latest available quote',help='Resets the editable simulated price to the latest provider quote'):
+            if q:st.session_state['paper_price']=float(q['price']);st.rerun()
+        st.caption('Quote timestamp: '+(dt.datetime.fromtimestamp(q['time'],dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if q and q['time'] else 'unavailable')+' • Quotes may be delayed')
         with st.form('paper_order'):
-            sym=st.selectbox('Ticker',symbols)
-            q=quote(sym)
             side=st.radio('Action',['BUY','SELL'],horizontal=True)
             qty=st.number_input('Shares',min_value=0.0001,value=1.,step=1.,format='%.4f')
-            price=st.number_input('Simulated execution price ($)',min_value=0.01,value=float(q['price']) if q else 100.,step=0.01)
+            price=st.number_input('Simulated execution price ($)',min_value=0.01,key='paper_price',step=0.01)
             reason=st.text_area('Trade rationale',placeholder='What data supports this decision?')
             if st.form_submit_button('Record PAPER trade',type='primary'):
                 if side=='BUY' and qty*price>cash+1e-6:st.error('Insufficient simulated cash.')
                 elif side=='SELL' and qty>hold.get(sym,0.)+1e-6:st.error('Insufficient simulated shares; short selling disabled.')
                 else:
-                    conn.execute('INSERT INTO orders(ts,symbol,side,shares,price,rationale) VALUES(?,?,?,?,?,?)',(dt.datetime.now(dt.timezone.utc).isoformat(),sym,side,qty,price,reason));conn.commit();st.success('Paper trade recorded — no brokerage order was placed.');st.rerun()
+                    conn.execute('INSERT INTO orders(ts,symbol,side,shares,price,rationale) VALUES(?,?,?,?,?,?)',(dt.datetime.now(dt.timezone.utc).isoformat(),sym,side,qty,price,reason));conn.commit();saved=remote_save(conn);st.success('Paper trade recorded — no brokerage order was placed.');
+                    if REMOTE_BACKUP and not saved:st.error('Remote backup failed. Download your journal CSV before leaving.')
+                    st.rerun()
         st.link_button('Open Fidelity separately','https://www.fidelity.com/')
     st.subheader('Simulated trade history')
     if len(orders):
+        if not REMOTE_BACKUP:st.warning('Download your journal CSV regularly. Streamlit local storage can be erased during restarts.')
         st.dataframe(orders.sort_values('id',ascending=False),hide_index=True,use_container_width=True)
         st.download_button('Download journal CSV',orders.to_csv(index=False),'marketiq_paper_journal.csv','text/csv')
     else:st.info('No simulated trades yet.')

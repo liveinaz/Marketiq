@@ -341,17 +341,17 @@ elif page in ('Overview','Stock Scanner'):
         st.dataframe(df,use_container_width=True,hide_index=True)
         if not df.empty:
             ticker_to_research=st.selectbox('Research a scanner result',df['Ticker'].tolist(),key='scan_research_ticker')
-            def open_detailed_research():
-    ticker = st.session_state['scan_research_ticker']
-    st.session_state['research_ticker'] = ticker
-    st.session_state['research_selector'] = ticker
-    st.session_state['nav_page'] = 'Stock Research'
+                        def open_detailed_research():
+                ticker = st.session_state['scan_research_ticker']
+                st.session_state['research_ticker'] = ticker
+                st.session_state['research_selector'] = ticker
+                st.session_state['nav_page'] = 'Stock Research'
 
-st.button(
-    'Open detailed research →',
-    type='primary',
-    on_click=open_detailed_research
-)
+            st.button(
+                'Open detailed research →',
+                type='primary',
+                on_click=open_detailed_research
+            )
         st.download_button('Export scanner CSV',df.to_csv(index=False),'marketiq_scanner.csv','text/csv')
         if any((r['Age (hours)'] or 0)>24 for r in rows):st.warning('Some quotes are more than 24 hours old. This may be normal after weekends/holidays, but verify before making decisions.')
         if len(rows)<len(selected[:batch]):st.warning('Some selected tickers returned no valid quote (possibly API limits or unavailable symbols). Wait a minute before retrying.')

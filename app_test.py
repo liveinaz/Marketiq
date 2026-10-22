@@ -340,11 +340,16 @@ elif page in ('Overview','Stock Scanner'):
             a,b,c=st.columns(3);a.metric('Stocks matching',len(df));b.metric('Research candidates',int((df['Score / 100']>=68).sum()));c.metric('Top score',int(df['Score / 100'].max()) if len(df) else '—')
         st.dataframe(df,use_container_width=True,hide_index=True)
         if not df.empty:
-            ticker_to_research=st.selectbox('Research a scanner result',df['Ticker'].tolist(),key='scan_research_ticker')
-                        def open_detailed_research():
+                    if not df.empty:
+            ticker_to_research = st.selectbox(
+                'Research a scanner result',
+                df['Ticker'].tolist(),
+                key='scan_research_ticker'
+            )
+
+            def open_detailed_research():
                 ticker = st.session_state['scan_research_ticker']
                 st.session_state['research_ticker'] = ticker
-                st.session_state['research_selector'] = ticker
                 st.session_state['nav_page'] = 'Stock Research'
 
             st.button(
